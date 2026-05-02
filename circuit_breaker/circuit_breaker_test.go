@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	redisdriver "github.com/rakhimjonshokirov/circuit-breaker/circuit_breaker/redis_driver"
+	"github.com/redis/go-redis/v9"
 )
 
 // ─── fake driver ────────────────────────────────────────────────────────────
@@ -160,8 +160,8 @@ func TestOpen_ToHalfOpen_AfterTimeout(t *testing.T) {
 func TestHalfOpen_ClosesAfterEnoughSuccesses(t *testing.T) {
 	fake := &fakeDriver{}
 	cb := noSyncCB(fake, func(s *Settings) {
-		s.Timeout      = 50 * time.Millisecond
-		s.MaxRequests  = 2
+		s.Timeout = 50 * time.Millisecond
+		s.MaxRequests = 2
 	})
 	defer cb.Stop()
 
@@ -268,9 +268,9 @@ func TestOnStateChange_Callback(t *testing.T) {
 	})
 	defer cb.Stop()
 
-	executeN(cb, 3, errDown)                          // Closed → Open
-	cb.tick(time.Now().Add(200 * time.Millisecond))   // Open → HalfOpen
-	executeN(cb, 1, nil)                              // HalfOpen → Closed
+	executeN(cb, 3, errDown)                        // Closed → Open
+	cb.tick(time.Now().Add(200 * time.Millisecond)) // Open → HalfOpen
+	executeN(cb, 1, nil)                            // HalfOpen → Closed
 
 	mu.Lock()
 	got := append([]string(nil), transitions...)
@@ -639,8 +639,8 @@ func benchCB() *CircuitBreaker {
 	return NewCircuitBreaker(Settings{
 		Redis:        &fakeDriver{},
 		Name:         "bench",
-		SyncInterval: time.Hour,                                     // no background Redis I/O
-		ReadyToTrip:  func(LocalCounts) bool { return false },       // never trip during bench
+		SyncInterval: time.Hour,                               // no background Redis I/O
+		ReadyToTrip:  func(LocalCounts) bool { return false }, // never trip during bench
 	})
 }
 
