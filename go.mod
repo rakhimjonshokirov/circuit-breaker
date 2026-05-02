@@ -1,4 +1,4 @@
-module github.com/toshkentov01/circuit-breaker
+module github.com/rakhimjonshokirov/circuit-breaker
 
 go 1.21.0
 
