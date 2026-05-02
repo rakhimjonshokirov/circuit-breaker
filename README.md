@@ -16,7 +16,7 @@ A production-grade, Redis-backed circuit breaker for Go services.
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.24+
 - Redis 4.0+ (uses `HSET`, `MULTI/EXEC`, Lua scripting)
 
 ## Installation

@@ -1,6 +1,6 @@
 module github.com/rakhimjonshokirov/circuit-breaker
 
-go 1.21.0
+go 1.24.0
 
 require github.com/redis/go-redis/v9 v9.5.3
 
