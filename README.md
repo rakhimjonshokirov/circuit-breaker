@@ -14,6 +14,12 @@ A production-grade, Redis-backed circuit breaker for Go services.
 - **Zero allocations** — `Execute` allocates nothing on the hot path.
 - **Structured logging** — `log/slog` (Go 1.21+), distinct log entries for every significant event.
 
+## Documentation
+
+| Document | Description |
+|---|---|
+| [Technical Deep Dive](docs/technical-deep-dive.md) | Internal architecture, Lua CAS script, hot-path analysis, concurrency guarantees, degraded mode, multi-pod reconciliation |
+
 ## Requirements
 
 - Go 1.24+
