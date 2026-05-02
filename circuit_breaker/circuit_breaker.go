@@ -124,7 +124,7 @@ type stateSnapshot struct {
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 //
-// Performance model
+// # Performance model
 //
 // Hot path (beforeRequest + afterRequest on every request):
 //   - One sync.RWMutex.RLock + struct copy   ≈  30 ns
@@ -569,6 +569,8 @@ func (cb *CircuitBreaker) tick(now time.Time) {
 	cb.cacheMu.RLock()
 	snap := cb.cache
 	cb.cacheMu.RUnlock()
+
+	slog.Info("ticker is running")
 
 	switch snap.state {
 	case StateClosed:
