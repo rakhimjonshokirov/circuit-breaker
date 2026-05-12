@@ -41,8 +41,11 @@ const (
 )
 
 var (
-	// ErrOpenState is returned when the CB state is open.
+	// ErrOpenState is returned when the circuit breaker is open.
 	ErrOpenState = errors.New("circuit breaker is open")
+	// ErrProbesFull is returned in HalfOpen when all concurrent probe slots are taken.
+	// Unlike ErrOpenState this is transient — slots free up as in-flight probes complete.
+	ErrProbesFull = errors.New("circuit breaker half-open: probe slots full")
 )
 
 // String implements stringer interface.
@@ -99,7 +102,7 @@ type LocalCounts struct {
 // Otherwise the error is counted as a failure.
 // If IsSuccessful is nil, default IsSuccessful is used, which returns false for all non-nil errors.
 type Settings struct {
-	Redis Driver
+	Driver Driver
 
 	Name         string
 	MaxRequests  uint32
@@ -234,7 +237,7 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.isSuccessful = st.IsSuccessful
 	}
 
-	cb.counts = st.Redis
+	cb.counts = st.Driver
 	cb.cache.Store(&stateSnapshot{})
 
 	// Fix #10: 3-second timeout for bootstrap — fail fast into degraded mode
@@ -274,7 +277,7 @@ func (cb *CircuitBreaker) Stop() {
 }
 
 func defaultReadyToTrip(counts LocalCounts) bool {
-	return counts.ConsecutiveFailures > defaultMaxConsecutiveFailures
+	return counts.ConsecutiveFailures >= defaultMaxConsecutiveFailures
 }
 
 func defaultIsSuccessful(err error) bool { return err == nil }
@@ -332,7 +335,7 @@ func (cb *CircuitBreaker) beforeRequest() (generation uint64, wasHalfOpen bool, 
 		// Fix #1: reject if already at the in-flight limit.
 		if cb.halfOpenInFlight.Add(1) > int32(cb.maxRequests) {
 			cb.halfOpenInFlight.Add(-1)
-			return snap.generation, false, ErrOpenState
+			return snap.generation, false, ErrProbesFull
 		}
 		return snap.generation, true, nil
 	default:

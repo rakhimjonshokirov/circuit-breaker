@@ -54,14 +54,9 @@ end
 
 local new_gen = cur_gen + 1
 redis.call('HSET', key,
-    'state_val',             to_state,
-    'expiry_unix',           expiry_unix,
-    'generation',            new_gen,
-    'requests',              0,
-    'total_successes',       0,
-    'total_failures',        0,
-    'consecutive_successes', 0,
-    'consecutive_failures',  0
+    'state_val',  to_state,
+    'expiry_unix', expiry_unix,
+    'generation', new_gen
 )
 if ttl_seconds > 0 then
     redis.call('EXPIRE', key, ttl_seconds)

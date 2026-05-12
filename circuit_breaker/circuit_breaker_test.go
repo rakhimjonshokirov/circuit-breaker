@@ -72,7 +72,7 @@ func (f *fakeDriver) NewGeneration(_ context.Context, fromState, toState int64, 
 
 func noSyncCB(fake *fakeDriver, patch ...func(*Settings)) *CircuitBreaker {
 	st := Settings{
-		Redis:        fake,
+		Driver:       fake,
 		Name:         "test",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 3 },
@@ -199,12 +199,12 @@ func TestHalfOpen_LimitsInFlightProbes(t *testing.T) {
 	assertState(t, cb, StateHalfOpen)
 
 	// First probe is allowed.
-	// Second concurrent probe must be rejected with ErrOpenState.
+	// Second concurrent probe must be rejected with ErrProbesFull.
 	cb.halfOpenInFlight.Store(1) // simulate one probe already in flight
 
 	err := cb.Execute(context.Background(), func() error { return nil })
-	if !errors.Is(err, ErrOpenState) {
-		t.Fatalf("expected ErrOpenState when in-flight limit reached, got %v", err)
+	if !errors.Is(err, ErrProbesFull) {
+		t.Fatalf("expected ErrProbesFull when in-flight limit reached, got %v", err)
 	}
 }
 
@@ -504,7 +504,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	defer rdb.Del(context.Background(), key)
 
 	cb := NewCircuitBreaker(Settings{
-		Redis:        redisdriver.New(rdb, key, time.Hour),
+		Driver:       redisdriver.New(rdb, key, time.Hour),
 		Name:         t.Name(),
 		SyncInterval: 20 * time.Millisecond,
 		Timeout:      80 * time.Millisecond,
@@ -535,7 +535,7 @@ func TestIntegration_TwoPods_ShareState(t *testing.T) {
 
 	newPod := func(name string) *CircuitBreaker {
 		return NewCircuitBreaker(Settings{
-			Redis:        redisdriver.New(rdb, key, time.Hour),
+			Driver:       redisdriver.New(rdb, key, time.Hour),
 			Name:         name,
 			SyncInterval: 20 * time.Millisecond,
 			ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 3 },
@@ -559,7 +559,7 @@ func TestIntegration_NewPod_InheritsOpenState(t *testing.T) {
 	defer rdb.Del(context.Background(), key)
 
 	pod1 := NewCircuitBreaker(Settings{
-		Redis:        redisdriver.New(rdb, key, time.Hour),
+		Driver:       redisdriver.New(rdb, key, time.Hour),
 		Name:         "pod1",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 3 },
@@ -570,7 +570,7 @@ func TestIntegration_NewPod_InheritsOpenState(t *testing.T) {
 	assertState(t, pod1, StateOpen)
 
 	pod2 := NewCircuitBreaker(Settings{
-		Redis:        redisdriver.New(rdb, key, time.Hour),
+		Driver:       redisdriver.New(rdb, key, time.Hour),
 		Name:         "pod2",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 3 },
@@ -586,7 +586,7 @@ func TestIntegration_IsDegraded_FalseWhenRedisUp(t *testing.T) {
 	defer rdb.Del(context.Background(), key)
 
 	cb := NewCircuitBreaker(Settings{
-		Redis:        redisdriver.New(rdb, key, time.Hour),
+		Driver:       redisdriver.New(rdb, key, time.Hour),
 		Name:         t.Name(),
 		SyncInterval: time.Hour,
 	})
@@ -601,7 +601,7 @@ func TestIntegration_IsDegraded_FalseWhenRedisUp(t *testing.T) {
 
 func benchCB() *CircuitBreaker {
 	return NewCircuitBreaker(Settings{
-		Redis:        &fakeDriver{},
+		Driver:       &fakeDriver{},
 		Name:         "bench",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(LocalCounts) bool { return false },
@@ -663,7 +663,7 @@ func BenchmarkBeforeRequest(b *testing.B) {
 
 func BenchmarkHotPath_MixedFailures_Parallel(b *testing.B) {
 	cb := NewCircuitBreaker(Settings{
-		Redis:        &fakeDriver{},
+		Driver:       &fakeDriver{},
 		Name:         "bench-mixed",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 1_000_000 },
@@ -701,7 +701,7 @@ func BenchmarkIntegration_Closed_Parallel(b *testing.B) {
 	defer rdb.Del(context.Background(), key)
 
 	cb := NewCircuitBreaker(Settings{
-		Redis:        redisdriver.New(rdb, key, time.Hour),
+		Driver:       redisdriver.New(rdb, key, time.Hour),
 		Name:         "bench-integration",
 		SyncInterval: time.Hour,
 		ReadyToTrip:  func(LocalCounts) bool { return false },
