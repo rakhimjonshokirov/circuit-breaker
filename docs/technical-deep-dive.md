@@ -30,8 +30,8 @@ This document explains the internal design of the circuit breaker — how it wor
 │  ┌──────────────┐    hot path      ┌───────────────────┐   │
 │  │  Your code   │ ──────────────►  │  CircuitBreaker   │   │
 │  │  Execute()   │                  │                   │   │
-│  └──────────────┘                  │  cacheMu RWMutex  │   │
-│                                    │  cache struct     │   │  ← in-process memory
+│  └──────────────┘                  │  cache  atomic.   │   │
+│                                    │         Pointer   │   │  ← in-process memory
 │                                    │  localConsecFail  │   │
 │                                    │  localConsecSucc  │   │
 │                                    └────────┬──────────┘   │
@@ -46,14 +46,9 @@ This document explains the internal design of the circuit breaker — how it wor
                               ┌──────────────────────────────┐
                               │  Redis hash key              │
                               │                              │
-                              │  state_val       = 0/1/2     │
-                              │  generation      = N         │
-                              │  expiry_unix     = unix ts   │
-                              │  requests        = 0         │
-                              │  total_successes = 0         │
-                              │  total_failures  = 0         │
-                              │  consec_success  = 0         │
-                              │  consec_failures = 0         │
+                              │  state_val   = 0/1/2         │
+                              │  generation  = N             │
+                              │  expiry_unix = unix ts       │
                               └──────────────────────────────┘
                                              ▲
                               same goroutine pattern on every other pod
@@ -74,24 +69,19 @@ All data lives in a single Redis hash under one key (e.g. `myservice:cb`).
 | `state_val` | integer | Current state: `0`=Closed, `1`=HalfOpen, `2`=Open |
 | `generation` | integer | Monotonically increasing counter. Incremented on every state transition. Used as a distributed version stamp. |
 | `expiry_unix` | integer | Unix timestamp when the current state expires and should transition. `0` means no expiry. |
-| `requests` | integer | Total requests in this generation (reset to 0 on each transition). |
-| `total_successes` | integer | Total successes in this generation. |
-| `total_failures` | integer | Total failures in this generation. |
-| `consecutive_successes` | integer | Reset to 0 on any failure. |
-| `consecutive_failures` | integer | Reset to 0 on any success. |
 
-**Important:** counters (`requests`, `total_*`, `consecutive_*`) are NOT incremented on every request. They are reset to 0 by the Lua script on every state transition. Between transitions, the per-request counting is done entirely in process memory.
+**No per-request counters in Redis.** Fields like `consecutive_failures`, `total_successes`, etc. are not stored — they are `atomic.Int64` fields in process memory and are reset to `0` whenever the generation changes.
 
 ### In process memory (fast, local, ephemeral)
 
 ```go
 type CircuitBreaker struct {
-    cacheMu         sync.RWMutex   // protects cache
-    cache           stateSnapshot  // local copy of Redis state machine fields
-    localConsecFail atomic.Int64   // failure counter — never written to Redis
-    localConsecSucc atomic.Int64   // success counter — never written to Redis
-    transitioning   atomic.Bool    // deduplication flag for concurrent transitions
-    degraded        atomic.Bool    // true while Redis is unreachable
+    cache            atomic.Pointer[stateSnapshot]  // lock-free reads (~1 ns)
+    localConsecFail  atomic.Int64                   // never written to Redis
+    localConsecSucc  atomic.Int64                   // never written to Redis
+    halfOpenInFlight atomic.Int32                   // in-flight probe cap
+    transitioning    atomic.Bool                    // within-process dedup
+    degraded         atomic.Bool                    // true while Redis unreachable
 }
 
 type stateSnapshot struct {
@@ -101,7 +91,7 @@ type stateSnapshot struct {
 }
 ```
 
-The `cache` struct is the pod's local view of what Redis holds. It is the only thing the hot path reads. The background goroutine is responsible for keeping it fresh.
+`cache` is the pod's local view of what Redis holds. It is the only thing the hot path reads. The background goroutine keeps it fresh. All writes are via `atomic.Pointer.Store` which is a single atomic instruction — no mutex needed for reads.
 
 ---
 
@@ -112,33 +102,46 @@ Every call to `Execute` passes through two functions: `beforeRequest` and `after
 ### `beforeRequest` — allow or reject
 
 ```go
-func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
-    cb.cacheMu.RLock()
-    snap := cb.cache        // struct copy — 3 fields, ~40 bytes
-    cb.cacheMu.RUnlock()
+func (cb *CircuitBreaker) beforeRequest() (generation uint64, wasHalfOpen bool, err error) {
+    snap := cb.cache.Load()   // single atomic load — ~1 ns, no mutex
 
-    if snap.state == StateOpen {
-        return snap.generation, ErrOpenState
+    switch snap.state {
+    case StateOpen:
+        return snap.generation, false, ErrOpenState
+
+    case StateHalfOpen:
+        // Enforce MaxRequests as a hard in-flight concurrency cap.
+        // Reject at the gate — not after the probe completes.
+        n := cb.halfOpenInFlight.Add(1)
+        if n > int32(cb.maxRequests) {
+            cb.halfOpenInFlight.Add(-1)
+            return snap.generation, false, ErrProbesFull
+        }
+        return snap.generation, true, nil
+
+    default: // StateClosed
+        return snap.generation, false, nil
     }
-    return snap.generation, nil
 }
 ```
 
-**Cost: one `RLock` + one struct copy ≈ 14 ns. Zero Redis I/O.**
+**Cost: one `atomic.Pointer.Load` ≈ 1 ns. Zero Redis I/O.**
 
 The function returns the current `generation` alongside the allow/reject decision. This generation is passed to `afterRequest` and used as a guard to discard stale results (explained in section 6).
+
+`ErrProbesFull` is a distinct error from `ErrOpenState` — callers can tell the difference between "circuit is hard-open, don't retry" and "HalfOpen probe slots are temporarily full, retry soon."
 
 ### `afterRequest` — record the result
 
 ```go
 func (cb *CircuitBreaker) afterRequest(ctx context.Context, before uint64, success bool) {
-    cb.cacheMu.RLock()
-    snap := cb.cache
-    cb.cacheMu.RUnlock()
+    snap := cb.cache.Load()
 
     if snap.generation != before {
         return  // stale — state changed between before and after, discard
     }
+
+    now := time.Now()
 
     if success {
         cb.localConsecFail.Store(0)
@@ -163,13 +166,40 @@ func (cb *CircuitBreaker) afterRequest(ctx context.Context, before uint64, succe
 }
 ```
 
-**Cost: one `RLock` + one or two `atomic.Int64` operations ≈ 30 ns. Zero Redis I/O in steady state.**
+**Cost: one `atomic.Pointer.Load` + one or two `atomic.Int64` operations ≈ 5–15 ns. Zero Redis I/O in steady state.**
 
-Redis is only touched inside `tryTransition`, which is called only when a state change is needed — rare compared to the millions of requests per second that go through the check above.
+Redis is only touched inside `tryTransition`, which is called only when a state change is needed — rare compared to the millions of requests per second that flow through the check above.
 
-### Why `atomic.Int64` instead of a mutex-protected field
+### `Execute` — the public API
 
-`atomic.Int64.Add` and `atomic.Int64.Store` are single CPU instructions (on amd64/arm64). They cost ~5 ns and produce zero allocations. A mutex for the same operation would be ~20 ns and block other goroutines.
+```go
+func (cb *CircuitBreaker) Execute(ctx context.Context, req func() error) error {
+    generation, wasHalfOpen, err := cb.beforeRequest()
+    if err != nil {
+        return err
+    }
+    if wasHalfOpen {
+        defer cb.halfOpenInFlight.Add(-1)  // release probe slot on any exit
+    }
+
+    defer func() {
+        if e := recover(); e != nil {
+            cb.afterRequest(ctx, generation, false)  // count panics as failures
+            panic(e)
+        }
+    }()
+
+    err = req()
+    cb.afterRequest(ctx, generation, cb.isSuccessful(err))
+    return err
+}
+```
+
+`req` is `func() error` — no `any` boxing, zero allocations on the hot path. The `defer` for panic recovery is stack-allocated by the Go compiler.
+
+### Why `atomic.Pointer` instead of `sync.RWMutex`
+
+A `sync.RWMutex.RLock` costs ~14 ns even under no contention. `atomic.Pointer.Load` is a single memory barrier instruction — ~1 ns. For a hot path called millions of times per second, this is a significant difference. Writes (transitions) are rare and still go through `atomic.Pointer.Store`, which is also a single atomic instruction.
 
 ---
 
@@ -202,20 +232,17 @@ end
 -- CAS passed: write new state atomically
 local new_gen = cur_gen + 1
 redis.call('HSET', key,
-    'state_val',             to_state,
-    'expiry_unix',           expiry_unix,
-    'generation',            new_gen,
-    'requests',              0,
-    'total_successes',       0,
-    'total_failures',        0,
-    'consecutive_successes', 0,
-    'consecutive_failures',  0
+    'state_val',  to_state,
+    'expiry_unix', expiry_unix,
+    'generation', new_gen
 )
 if ttl_seconds > 0 then
     redis.call('EXPIRE', key, ttl_seconds)
 end
 return new_gen
 ```
+
+Only three fields are written. Per-request counters are never stored in Redis — they live in `atomic.Int64` fields in process memory and are reset locally when the generation changes.
 
 ### Why Lua and not a transaction?
 
@@ -236,7 +263,7 @@ Pod A (Closed→Open):            Pod B (Closed→Open, concurrent):
                                   cur_state(2) != from_state(0) → return -1
 ```
 
-Pod B gets `-1`, calls `refreshCache`, and adopts the state Pod A wrote. `onStateChange` fires exactly once.
+Pod B gets `-1`, calls `refreshCache`, and adopts the state Pod A wrote. `onStateChange` fires exactly once per pod.
 
 ### The `-1` sentinel (initialization)
 
@@ -259,19 +286,20 @@ When `fromState = -1`, the script checks if the key already exists (`raw_gen ~= 
 4. tryTransition(ctx, Closed, Open, now)
    └── transitioning.CompareAndSwap(false, true) → acquired
        setState(ctx, Closed, Open, now)
-       └── GetStateSnapshot() → reads Redis: state=0, gen=N
-           State(0) == Closed ✓ (matches from)
-           NewGeneration(ctx, 0, 2, expiry=now+Timeout)
+       └── NewGeneration(ctx, from=0, to=2, expiry=now+Timeout)
+               [no pre-read GetStateSnapshot — CAS reads state_val internally]
            └── Lua CAS: cur_state==0==from_state ✓
                         new_gen = N+1
-                        HSET state_val=2 expiry_unix=T generation=N+1 ...reset counters...
+                        HSET state_val=2 expiry_unix=T generation=N+1
                         returns N+1
-           cache = {state: Open, generation: N+1, expiry: now+Timeout}
+           cache.Store(&stateSnapshot{state: Open, generation: N+1, expiry: now+Timeout})
            localConsecFail.Store(0)
            localConsecSucc.Store(0)
            onStateChange("myservice", Closed, Open)
        transitioning.Store(false)
 ```
+
+Note: there is no `GetStateSnapshot` before `NewGeneration`. The Lua CAS already reads `state_val` internally and returns `-1` on mismatch. Removing the pre-read halves the number of Redis round-trips per transition.
 
 ### Open → HalfOpen (timeout)
 
@@ -279,12 +307,13 @@ This is not triggered by a request — it is driven by the background goroutine.
 
 ```
 1. syncLoop ticker fires
-2. tick(now)
-   └── cacheMu.RLock() → snap = {state: Open, expiry: T}
+2. tick(ctx, now)
+   └── snap = cache.Load() → {state: Open, expiry: T}
        snap.expiry.Before(now) → true
        tryTransition(ctx, Open, HalfOpen, now)
-       └── setState: GetStateSnapshot, NewGeneration(0→2, 2→1, expiry=zero)
-           cache = {state: HalfOpen, generation: N+2, expiry: zero}
+       └── setState: NewGeneration(from=2, to=1, expiry=zero)
+           halfOpenInFlight.Store(0)   ← reset probe counter for clean HalfOpen window
+           cache.Store(&stateSnapshot{state: HalfOpen, generation: N+2})
 3. refreshCache() also called in tick — syncs with Redis
 ```
 
@@ -295,8 +324,8 @@ This is not triggered by a request — it is driven by the background goroutine.
 2. localConsecSucc.Add(1) → newSucc
 3. snap.state == HalfOpen && uint32(newSucc) >= maxRequests → true
 4. tryTransition(ctx, HalfOpen, Closed, now)
-   └── NewGeneration(1→1, 0=Closed, expiry depending on Interval)
-       cache = {state: Closed, generation: N+3}
+   └── NewGeneration(from=1, to=0, expiry depending on Interval)
+       cache.Store(&stateSnapshot{state: Closed, generation: N+3})
 ```
 
 ### HalfOpen → Open (probe fails)
@@ -318,11 +347,11 @@ The generation counter solves a subtle distributed race condition.
 ```
 Time →
 T1: Request R starts. beforeRequest() → snap.state=Closed, allowed.
-T2: Circuit trips: Closed→Open. Cache updated.
+T2: Circuit trips: Closed→Open. Cache updated. generation N → N+1.
 T3: Request R finishes. afterRequest() → records SUCCESS.
     But this success happened AFTER the trip — it is stale.
-    Without a guard, this success would decrement the failure counter
-    for the NEW generation, potentially preventing the next trip.
+    Without a guard, this success would count toward the new generation,
+    potentially preventing the next trip.
 ```
 
 ### The solution
@@ -330,6 +359,7 @@ T3: Request R finishes. afterRequest() → records SUCCESS.
 `beforeRequest` returns the generation at the time of the decision. `afterRequest` re-reads the current generation and compares:
 
 ```go
+snap := cb.cache.Load()
 if snap.generation != before {
     return  // state changed between before and after — discard result
 }
@@ -347,10 +377,9 @@ When Redis is unreachable, the generation is incremented locally:
 
 ```go
 func (cb *CircuitBreaker) applyStateLocally(from, to State, now time.Time) {
-    cb.cacheMu.Lock()
-    newGen := cb.cache.generation + 1   // local increment, no Redis
-    cb.cache = stateSnapshot{state: to, generation: newGen, expiry: newExpiry}
-    cb.cacheMu.Unlock()
+    prev := cb.cache.Load()
+    newGen := prev.generation + 1  // local increment, no Redis
+    cb.cache.Store(&stateSnapshot{state: to, generation: newGen, expiry: newExpiry})
 }
 ```
 
@@ -363,26 +392,29 @@ This still prevents stale results within the pod. The cross-pod guarantee is tem
 Every `CircuitBreaker` starts exactly one goroutine at construction time.
 
 ```go
-func (cb *CircuitBreaker) syncLoop() {
-    ticker := time.NewTicker(cb.syncInterval)  // default 100ms
+func (cb *CircuitBreaker) syncLoop(ctx context.Context) {
+    defer cb.wg.Done()  // Stop() blocks until this returns
+    ticker := time.NewTicker(cb.syncInterval)
     defer ticker.Stop()
     for {
         select {
-        case <-cb.stopSync:
+        case <-ctx.Done():   // cancelled by Stop()
             return
         case now := <-ticker.C:
-            cb.tick(now)
+            cb.tick(ctx, now)
         }
     }
 }
 ```
 
+`ctx` is derived from `context.WithCancel` stored as `stopCancel`. When `Stop()` is called, it cancels the context — any in-progress Redis calls inside `tick` are also cancelled. `Stop()` then blocks on `wg.Wait()` until the goroutine exits, so the caller can safely close the Redis connection immediately after `Stop()` returns.
+
 ### What `tick` does
 
 ```
-tick(now)
+tick(ctx, now)
  │
- ├── 1. cacheMu.RLock() → read local cache (no Redis)
+ ├── 1. snap = cache.Load()  (no Redis)
  │      Check time-based transitions:
  │      ├── state==Closed && expiry non-zero && expiry.Before(now)
  │      │     → tryTransition(Closed→Closed)  [resets counts for new interval]
@@ -390,12 +422,14 @@ tick(now)
  │            → tryTransition(Open→HalfOpen)
  │
  └── 2. refreshCache(ctx)
-         └── GetStateSnapshot() → one Redis round-trip
+         └── GetStateSnapshot() → one Redis HMGET round-trip
              ├── if degraded==true: reconcileWithRedis()
              └── if degraded==false: applyRedisSnapshot()
                    updates cache.state / cache.generation / cache.expiry
                    if generation changed: reset local atomic counters
 ```
+
+No log line fires on every tick. The removed `slog.Info("ticker is running")` was firing 10×/sec in production and flooding log storage.
 
 ### Redis load calculation
 
@@ -404,7 +438,7 @@ At `SyncInterval = 100ms`:
 - 10 ticks/sec × 1 HMGET = **10 Redis reads/sec per pod**
 - 3 pods = 30 reads/sec total — regardless of whether the service handles 1 RPS or 1,000,000 RPS
 
-State transitions add 1-2 extra Redis commands but happen rarely (only when the circuit trips or recovers).
+State transitions add 1 extra Redis command (Lua CAS) but happen rarely (only when the circuit trips or recovers).
 
 ---
 
@@ -414,7 +448,7 @@ State transitions add 1-2 extra Redis commands but happen rarely (only when the 
 
 Redis failure is detected at two points:
 
-1. **Startup**: `NewCircuitBreaker` calls `NewGeneration(-1, ...)`. If Redis returns an error, `degraded.Store(true)` is set immediately.
+1. **Startup**: `NewCircuitBreaker` calls `NewGeneration(-1, ...)` with a 3-second timeout. If Redis is slow or unavailable, the breaker starts in degraded mode without blocking service startup.
 2. **During operation**: `refreshCache` (called by `tick`) calls `GetStateSnapshot`. If it errors, `enterDegraded(err)` is called.
 
 ```go
@@ -434,7 +468,8 @@ When a state transition is needed and Redis is down:
 
 ```go
 func (cb *CircuitBreaker) setState(ctx, from, to, now) error {
-    stateVal, _, _, err := cb.counts.GetStateSnapshot(ctx)
+    newExpiry := cb.expiryForState(to, now)
+    gen, ok, err := cb.counts.NewGeneration(ctx, int64(from), int64(to), newExpiry)
     if err != nil {
         cb.enterDegraded(err)
         cb.applyStateLocally(from, to, now)  // write to in-process cache only
@@ -444,7 +479,7 @@ func (cb *CircuitBreaker) setState(ctx, from, to, now) error {
 }
 ```
 
-`applyStateLocally` increments the local generation and updates the cache struct under `cacheMu.Lock()`. The downstream service continues to be protected — the circuit breaker still trips, still rejects requests, still transitions to HalfOpen after timeout. It just does all of this in-process only.
+`applyStateLocally` increments the local generation and calls `cache.Store`. The downstream service continues to be protected — the circuit breaker still trips, still rejects requests, still transitions to HalfOpen after timeout. It just does all of this in-process only.
 
 ---
 
@@ -473,25 +508,29 @@ func (cb *CircuitBreaker) refreshCache(ctx context.Context) error {
 
 ### Reconciliation rule: most protective state wins
 
+```go
+var statePriority = map[State]int{
+    StateClosed:   0,
+    StateHalfOpen: 1,
+    StateOpen:     2,
+}
 ```
-Open (2) > HalfOpen (1) > Closed (0)
-```
+
+An explicit map is used rather than comparing state integer values directly. This way, adding a new state or reordering iota values cannot silently break reconciliation logic.
 
 ```go
 func (cb *CircuitBreaker) reconcileWithRedis(ctx, redisState, redisExpiry, redisGen) error {
-    localSnap := cb.cache  // read under RLock
+    localSnap := cb.cache.Load()
 
-    if localSnap.state > redisState {
-        // Local is more protective (e.g. this pod tripped while Redis was down)
-        // Push local state to Redis so all peers converge
+    if statePriority[localSnap.state] > statePriority[redisState] {
+        // Local is more protective — push to Redis so all peers converge
         gen, ok, err := cb.counts.NewGeneration(ctx,
-            int64(redisState),     // from: what Redis currently holds
+            int64(redisState),      // from: what Redis currently holds
             int64(localSnap.state), // to:   what this pod observed
             newExpiry,
         )
         if ok {
-            // Our CAS won — update cache with Redis-authoritative generation
-            cb.cache = stateSnapshot{state: localSnap.state, generation: gen}
+            cb.cache.Store(&stateSnapshot{state: localSnap.state, generation: gen})
             return nil
         }
         // CAS lost — another pod raced us and already wrote a state
@@ -499,9 +538,10 @@ func (cb *CircuitBreaker) reconcileWithRedis(ctx, redisState, redisExpiry, redis
     }
 
     // Redis is same or more protective — adopt it
-    cb.cache = stateSnapshot{state: redisState, generation: redisGen, expiry: redisExpiry}
+    cb.cache.Store(&stateSnapshot{state: redisState, generation: redisGen, expiry: redisExpiry})
     cb.localConsecFail.Store(0)
     cb.localConsecSucc.Store(0)
+    return nil
 }
 ```
 
@@ -510,7 +550,7 @@ func (cb *CircuitBreaker) reconcileWithRedis(ctx, redisState, redisExpiry, redis
 **Scenario A: This pod tripped during outage, Redis still shows Closed**
 ```
 Local: Open (gen=local+1)    Redis: Closed (gen=N)
-localSnap.state(2) > redisState(0) → push Open to Redis
+statePriority[Open](2) > statePriority[Closed](0) → push Open to Redis
 NewGeneration(from=0, to=2) → CAS succeeds → gen=N+1
 All other pods pick up Open on their next tick (within 100ms)
 ```
@@ -518,8 +558,8 @@ All other pods pick up Open on their next tick (within 100ms)
 **Scenario B: Another pod tripped Redis while this pod was degraded**
 ```
 Local: Closed (gen=N, unchanged during outage)    Redis: Open (gen=N+3)
-localSnap.state(0) < redisState(2) → adopt Redis
-cache = {state: Open, generation: N+3}
+statePriority[Closed](0) < statePriority[Open](2) → adopt Redis
+cache.Store({state: Open, generation: N+3})
 onStateChange fires: Closed → Open
 ```
 
@@ -542,14 +582,14 @@ The Redis hash key persists as long as the TTL hasn't expired. On startup:
 ```
 NewCircuitBreaker()
  │
- ├── NewGeneration(fromState=-1, toState=Closed, expiry)
+ ├── NewGeneration(fromState=-1, toState=Closed, expiry)  [3s timeout]
  │    └── Lua: from_state==-1 → check if raw_gen != false
  │         key EXISTS → return cur_gen (no write, no reset)   ← safe restart
  │         key MISSING → HSET all fields to Closed/gen=1      ← fresh start
  │
  └── refreshCache()
       └── GetStateSnapshot() → reads current state_val, expiry_unix, generation
-          cache = whatever Redis holds
+          cache.Store(whatever Redis holds)
           (if Redis has Open, pod starts in Open state immediately)
 ```
 
@@ -574,17 +614,17 @@ State (`Open`/`HalfOpen`/`Closed`) and its expiry timestamp are fully durable in
 
 | Operation | Cost | Redis I/O |
 |---|---|---|
-| `beforeRequest` | ~14 ns | 0 |
-| `afterRequest` (no transition) | ~30 ns | 0 |
-| `afterRequest` (transition triggered) | ~30 ns + 1-2 Redis RTT | 1-2 |
-| Background sync tick | 0 ns (goroutine) | 1 `HMGET` per `SyncInterval` |
-| State transition (Lua CAS) | 1-2 Redis RTT | 1 `EVALSHA` + optional `HMGET` |
+| `beforeRequest` | ~1 ns (`atomic.Pointer.Load`) | 0 |
+| `afterRequest` (no transition) | ~5–15 ns (1 load + 1-2 atomic ops) | 0 |
+| `afterRequest` (transition triggered) | ~5 ns + 1 Redis RTT | 1 |
+| Background sync tick | 0 ns goroutine overhead | 1 `HMGET` per `SyncInterval` |
+| State transition (Lua CAS) | 1 Redis RTT | 1 `EVALSHA` |
 
 ### Why zero allocations on the hot path
 
-- `beforeRequest`: `RLock` + struct copy — the struct is value-typed (no pointers inside `stateSnapshot`), copy is stack-allocated.
-- `afterRequest`: `RLock` + struct copy + `atomic.Int64.Add/Store` — all stack or register operations.
-- `Execute` itself: wraps the two functions above. The `defer` for panic recovery is stack-allocated by the Go compiler.
+- `beforeRequest`: `atomic.Pointer.Load` returns a pointer to the current `stateSnapshot` — no allocation, no copy.
+- `afterRequest`: same load + `atomic.Int64.Add/Store` — all register or cache-line operations.
+- `Execute`: the `defer` for panic recovery is stack-allocated by the Go compiler. `req func() error` carries no boxing since `func() error` has no return value to box.
 
 The `b.ReportAllocs()` benchmark confirms `0 B/op, 0 allocs/op` on all hot-path benchmarks.
 
@@ -592,7 +632,7 @@ The `b.ReportAllocs()` benchmark confirms `0 B/op, 0 allocs/op` on all hot-path 
 
 At 8 goroutines on Apple M1 Pro:
 - `BenchmarkHotPath_Closed_Parallel`: ~304 ns/op
-- Throughput per goroutine: 1s / 304ns ≈ 3.3M ops/sec
+- Throughput per goroutine: 1s / 304 ns ≈ 3.3M ops/sec
 - 8 goroutines: ~26M Execute() calls/sec on a single process
 
 At 100k RPS (100,000 requests/sec), the circuit breaker overhead is negligible.
@@ -605,10 +645,11 @@ At 100k RPS (100,000 requests/sec), the circuit breaker overhead is negligible.
 
 | Race | Guard |
 |---|---|
-| Multiple goroutines reading `cache` | `cacheMu.RWMutex` — unlimited concurrent readers |
-| Multiple goroutines writing `cache` | `cacheMu.Lock()` — exclusive write lock, only during transitions and sync |
+| Multiple goroutines reading `cache` | `atomic.Pointer.Load` — lock-free, no blocking |
+| Multiple goroutines writing `cache` | `atomic.Pointer.Store` — single atomic instruction; only on transitions (rare) |
 | Multiple goroutines incrementing `localConsecFail` | `atomic.Int64.Add` — lock-free |
 | Multiple goroutines attempting a transition simultaneously | `transitioning.CompareAndSwap(false, true)` — only one proceeds |
+| Multiple goroutines in HalfOpen simultaneously | `halfOpenInFlight.Add(1)` checked against `maxRequests` — lock-free probe cap |
 
 ### Across pods
 
