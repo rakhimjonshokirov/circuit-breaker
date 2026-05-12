@@ -22,11 +22,22 @@ const (
 	StateOpen
 )
 
+// statePriority maps each State to its protection level.
+// Fix #9: explicit map — reconciliation correctness does not depend on iota ordering.
+// If states are ever reordered or a new state is added, this map must be updated,
+// and the compiler will not silently produce wrong comparisons.
+var statePriority = map[State]int{
+	StateClosed:   0,
+	StateHalfOpen: 1,
+	StateOpen:     2,
+}
+
 const (
 	defaultInterval               = time.Duration(0)
 	defaultTimeout                = 60 * time.Second
 	defaultSyncInterval           = 100 * time.Millisecond
 	defaultMaxConsecutiveFailures = 10
+	defaultBootstrapTimeout       = 3 * time.Second
 )
 
 var (
@@ -119,7 +130,7 @@ type Driver interface {
 type stateSnapshot struct {
 	state      State
 	generation uint64
-	expiry     time.Time // used by syncLoop to drive time-based transitions
+	expiry     time.Time
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
@@ -127,8 +138,8 @@ type stateSnapshot struct {
 // # Performance model
 //
 // Hot path (beforeRequest + afterRequest on every request):
-//   - One sync.RWMutex.RLock + struct copy   ≈  30 ns
-//   - One or two sync/atomic operations       ≈  10 ns
+//   - One atomic.Pointer.Load (cache read)     ≈   1 ns   fix #3
+//   - One or two sync/atomic operations        ≈  10 ns
 //   - Zero Redis I/O
 //
 // Background sync (syncLoop, runs every SyncInterval, default 100ms):
@@ -136,7 +147,7 @@ type stateSnapshot struct {
 //   - At 100ms: ~10 Redis reads/sec per instance, regardless of RPS
 //
 // State transitions (rare — only on trip/recover):
-//   - One NewGeneration Lua CAS round-trip
+//   - One NewGeneration Lua CAS round-trip     fix #2: was two round-trips
 //   - Deduplicated within the process via transitioning CAS flag
 //
 // Redis unavailability (degraded mode):
@@ -156,24 +167,35 @@ type CircuitBreaker struct {
 
 	counts Driver
 
-	// Local state cache — the entire hot path reads from here, never from Redis.
-	cacheMu sync.RWMutex
-	cache   stateSnapshot
+	// Fix #3: atomic.Pointer replaces sync.RWMutex + struct field.
+	// Reads are a single atomic load (~1 ns); writes (rare, only on transitions) use Store.
+	cache atomic.Pointer[stateSnapshot]
 
 	// Local atomic counters — zero Redis writes on the hot path.
 	localConsecFail atomic.Int64
 	localConsecSucc atomic.Int64
 
-	// Deduplicates concurrent transition attempts within one process.
+	// Fix #1: halfOpenInFlight enforces MaxRequests as a hard concurrency limit on
+	// in-flight probe requests, not just a completion count.
+	// Incremented in beforeRequest when state==HalfOpen, decremented via defer in Execute.
+	// Reset to 0 on every HalfOpen entry (fix #8).
+	halfOpenInFlight atomic.Int32
+
+	// transitioning deduplicates concurrent transition attempts within one process.
 	// Cross-instance races are handled by the Lua CAS in NewGeneration.
 	transitioning atomic.Bool
 
 	// degraded is true while Redis is unreachable.
-	// Transitions during this window are applied locally and reconciled on recovery.
-	// Logged once when entering and once when leaving — no per-tick spam.
+	// Logged once when entering, once when leaving — no per-tick spam.
 	degraded atomic.Bool
 
-	stopSync chan struct{}
+	// Fix #5: stopCancel propagates cancellation into the background goroutine
+	// so in-flight Redis calls are cancelled when Stop() is called.
+	stopCancel context.CancelFunc
+
+	// Fix #6: wg ensures Stop() blocks until the goroutine has fully exited,
+	// so callers can safely tear down the Redis connection after Stop() returns.
+	wg sync.WaitGroup
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -213,33 +235,41 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	}
 
 	cb.counts = st.Redis
-	cb.stopSync = make(chan struct{})
+	cb.cache.Store(&stateSnapshot{})
 
-	ctx := context.Background()
+	// Fix #10: 3-second timeout for bootstrap — fail fast into degraded mode
+	// rather than blocking service startup for the full Redis dial timeout.
+	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), defaultBootstrapTimeout)
+	defer bootstrapCancel()
+
 	expiry := cb.expiryForState(StateClosed, time.Now())
-
-	if _, _, err := cb.counts.NewGeneration(ctx, -1, int64(StateClosed), expiry); err != nil {
-		// Redis unavailable at startup — safe default is StateClosed local-only mode.
+	if _, _, err := cb.counts.NewGeneration(bootstrapCtx, -1, int64(StateClosed), expiry); err != nil {
 		cb.degraded.Store(true)
 		slog.Warn("circuit_breaker: Redis unavailable at startup, running in local mode",
 			"name", cb.name, "error", err)
-	} else if err := cb.refreshCache(ctx); err != nil {
-		// Key written but read failed — still start degraded.
+	} else if err := cb.refreshCache(bootstrapCtx); err != nil {
 		cb.degraded.Store(true)
 		slog.Warn("circuit_breaker: initial state load failed, running in local mode",
 			"name", cb.name, "error", err)
 	}
 
-	go cb.syncLoop()
+	// Fix #5: cancellable context flows into syncLoop → tick → refreshCache → Redis calls.
+	var stopCtx context.Context
+	stopCtx, cb.stopCancel = context.WithCancel(context.Background())
+	cb.wg.Add(1)
+	go cb.syncLoop(stopCtx)
 
 	slog.Info("circuit_breaker: initialized",
 		"name", cb.name, "sync_interval", cb.syncInterval, "degraded", cb.degraded.Load())
 	return cb
 }
 
-// Stop shuts down the background sync goroutine. Call when the service shuts down.
+// Stop cancels the background goroutine's context and waits for it to exit.
+// Fix #6: returns only after the goroutine has fully stopped; callers can safely
+// close the Redis connection immediately after Stop() returns.
 func (cb *CircuitBreaker) Stop() {
-	close(cb.stopSync)
+	cb.stopCancel()
+	cb.wg.Wait()
 	slog.Info("circuit_breaker: stopped", "name", cb.name)
 }
 
@@ -254,10 +284,7 @@ func (cb *CircuitBreaker) Name() string { return cb.name }
 
 // State returns the current state from the local cache — no Redis I/O.
 func (cb *CircuitBreaker) State() State {
-	cb.cacheMu.RLock()
-	s := cb.cache.state
-	cb.cacheMu.RUnlock()
-	return s
+	return cb.cache.Load().state
 }
 
 // IsDegraded reports whether Redis is currently unreachable.
@@ -266,16 +293,17 @@ func (cb *CircuitBreaker) State() State {
 func (cb *CircuitBreaker) IsDegraded() bool { return cb.degraded.Load() }
 
 // Execute runs the given request if the CircuitBreaker accepts it.
-// Execute returns an error instantly if the CircuitBreaker rejects the request.
-// Otherwise, Execute returns the result of the request.
-// If a panic occurs in the request, the CircuitBreaker handles it as an error
-// and causes the same panic again.
-func (cb *CircuitBreaker) Execute(
-	ctx context.Context, req func() (any, error),
-) (any, error) {
-	generation, err := cb.beforeRequest()
+// Fix #7: req is func() error — no any boxing, zero allocations on the hot path.
+// Panics inside req are caught, counted as failures, and re-panicked.
+func (cb *CircuitBreaker) Execute(ctx context.Context, req func() error) error {
+	generation, wasHalfOpen, err := cb.beforeRequest()
 	if err != nil {
-		return nil, err
+		return err
+	}
+	// Fix #1: decrement the in-flight probe counter when the probe completes,
+	// regardless of success, failure, or panic.
+	if wasHalfOpen {
+		defer cb.halfOpenInFlight.Add(-1)
 	}
 
 	defer func() {
@@ -286,36 +314,37 @@ func (cb *CircuitBreaker) Execute(
 		}
 	}()
 
-	result, err := req()
+	err = req()
 	cb.afterRequest(ctx, generation, cb.isSuccessful(err))
-	return result, err
+	return err
 }
 
 // beforeRequest is the allow/reject decision — the innermost hot path.
-// Cost: one RLock + one struct copy. Zero Redis I/O, even in degraded mode.
-func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
-	cb.cacheMu.RLock()
-	snap := cb.cache
-	cb.cacheMu.RUnlock()
+// Fix #3: single atomic.Pointer.Load, no mutex, ~1 ns.
+// Fix #1: enforces MaxRequests as a hard in-flight concurrency limit in HalfOpen.
+func (cb *CircuitBreaker) beforeRequest() (generation uint64, wasHalfOpen bool, err error) {
+	snap := cb.cache.Load()
 
-	if snap.state == StateOpen {
-		return snap.generation, ErrOpenState
+	switch snap.state {
+	case StateOpen:
+		return snap.generation, false, ErrOpenState
+	case StateHalfOpen:
+		// Fix #1: reject if already at the in-flight limit.
+		if cb.halfOpenInFlight.Add(1) > int32(cb.maxRequests) {
+			cb.halfOpenInFlight.Add(-1)
+			return snap.generation, false, ErrOpenState
+		}
+		return snap.generation, true, nil
+	default:
+		return snap.generation, false, nil
 	}
-	return snap.generation, nil
 }
 
 // afterRequest records the result — also hot path.
-// Cost: one RLock + one or two atomic ops. Zero Redis I/O in steady state.
-// Redis is only touched when a state transition is triggered (rare).
+// Cost: one atomic.Pointer.Load + one or two atomic ops. Zero Redis I/O in steady state.
 func (cb *CircuitBreaker) afterRequest(ctx context.Context, before uint64, success bool) {
-	cb.cacheMu.RLock()
-	snap := cb.cache
-	cb.cacheMu.RUnlock()
+	snap := cb.cache.Load()
 
-	// Discard results from a previous generation.
-	// The generation is Redis-authoritative in normal mode, so this guard works
-	// across all pods. In degraded mode it is locally incremented, so it still
-	// prevents stale results within the pod.
 	if snap.generation != before {
 		slog.Debug("circuit_breaker: stale generation, discarding result",
 			"name", cb.name, "before", before, "current", snap.generation)
@@ -366,44 +395,30 @@ func (cb *CircuitBreaker) tryTransition(ctx context.Context, from, to State, now
 	}
 }
 
-// setState writes the transition to Redis via Lua CAS, then updates the local cache.
-// If Redis is unreachable the transition is applied locally so the circuit breaker
-// keeps protecting the downstream service. The pod is marked degraded and the
-// background sync will reconcile state once Redis recovers.
+// setState commits a transition to Redis via Lua CAS, then updates the local cache.
+// Fix #2: goes directly to NewGeneration — eliminates the redundant GetStateSnapshot
+// round-trip. The Lua CAS already reads state_val and returns -1 on mismatch.
+// If Redis is unreachable the transition is applied locally.
 func (cb *CircuitBreaker) setState(ctx context.Context, from, to State, now time.Time) error {
-	stateVal, _, _, err := cb.counts.GetStateSnapshot(ctx)
-	if err != nil {
-		// Redis unreachable — apply locally so protection is not lost.
-		cb.enterDegraded(err)
-		cb.applyStateLocally(from, to, now)
-		return nil
-	}
-
-	if State(stateVal) != from {
-		// A peer already transitioned. Sync the cache and continue.
-		slog.Debug("circuit_breaker: setState: peer already transitioned",
-			"name", cb.name, "expected_from", from, "actual", State(stateVal))
-		return cb.refreshCache(ctx)
-	}
-
 	newExpiry := cb.expiryForState(to, now)
 	gen, ok, err := cb.counts.NewGeneration(ctx, int64(from), int64(to), newExpiry)
 	if err != nil {
-		// Redis went away between GetStateSnapshot and NewGeneration — apply locally.
 		cb.enterDegraded(err)
 		cb.applyStateLocally(from, to, now)
 		return nil
 	}
 	if !ok {
-		// CAS race with a peer — sync and move on.
 		slog.Debug("circuit_breaker: setState CAS missed, syncing",
 			"name", cb.name, "from", from, "to", to)
 		return cb.refreshCache(ctx)
 	}
 
-	cb.cacheMu.Lock()
-	cb.cache = stateSnapshot{state: to, generation: gen, expiry: newExpiry}
-	cb.cacheMu.Unlock()
+	// Fix #8: reset in-flight probe counter on every HalfOpen entry so a leaked
+	// count from the previous cycle cannot starve the new one of probes.
+	if to == StateHalfOpen {
+		cb.halfOpenInFlight.Store(0)
+	}
+	cb.cache.Store(&stateSnapshot{state: to, generation: gen, expiry: newExpiry})
 	cb.localConsecFail.Store(0)
 	cb.localConsecSucc.Store(0)
 
@@ -415,15 +430,18 @@ func (cb *CircuitBreaker) setState(ctx context.Context, from, to State, now time
 	return nil
 }
 
-// applyStateLocally updates the local cache directly without touching Redis.
-// Used when Redis is unavailable. The generation is incremented locally so
-// in-flight requests with the old generation are correctly discarded.
+// applyStateLocally updates the local cache without touching Redis.
+// Used when Redis is unavailable. Locally increments generation so in-flight
+// requests from the previous generation are correctly discarded.
 func (cb *CircuitBreaker) applyStateLocally(from, to State, now time.Time) {
 	newExpiry := cb.expiryForState(to, now)
-	cb.cacheMu.Lock()
-	newGen := cb.cache.generation + 1
-	cb.cache = stateSnapshot{state: to, generation: newGen, expiry: newExpiry}
-	cb.cacheMu.Unlock()
+	prev := cb.cache.Load()
+	newGen := prev.generation + 1
+	// Fix #8: same reset on local HalfOpen entry as on Redis-backed entry.
+	if to == StateHalfOpen {
+		cb.halfOpenInFlight.Store(0)
+	}
+	cb.cache.Store(&stateSnapshot{state: to, generation: newGen, expiry: newExpiry})
 	cb.localConsecFail.Store(0)
 	cb.localConsecSucc.Store(0)
 
@@ -435,7 +453,6 @@ func (cb *CircuitBreaker) applyStateLocally(from, to State, now time.Time) {
 }
 
 // refreshCache reads the authoritative state from Redis and updates the local snapshot.
-// If the generation changed (a peer transitioned), local counters are reset.
 // On the first successful read after a degraded period, reconcileWithRedis is called.
 func (cb *CircuitBreaker) refreshCache(ctx context.Context) error {
 	stateVal, expiry, gen, err := cb.counts.GetStateSnapshot(ctx)
@@ -444,7 +461,6 @@ func (cb *CircuitBreaker) refreshCache(ctx context.Context) error {
 		return err
 	}
 
-	// Redis is reachable. If we were degraded, reconcile before adopting Redis state.
 	if cb.degraded.CompareAndSwap(true, false) {
 		slog.Info("circuit_breaker: Redis reconnected, reconciling state", "name", cb.name)
 		return cb.reconcileWithRedis(ctx, State(stateVal), expiry, gen)
@@ -454,72 +470,63 @@ func (cb *CircuitBreaker) refreshCache(ctx context.Context) error {
 	return nil
 }
 
-// applyRedisSnapshot updates the local cache from already-read Redis values.
-// No Redis I/O — callers are responsible for reading first.
+// applyRedisSnapshot updates the local cache from already-read Redis values. No Redis I/O.
 func (cb *CircuitBreaker) applyRedisSnapshot(stateVal int64, expiry time.Time, gen uint64) {
-	cb.cacheMu.Lock()
-	prev := cb.cache
-	cb.cache = stateSnapshot{state: State(stateVal), generation: gen, expiry: expiry}
-	cb.cacheMu.Unlock()
+	prev := cb.cache.Load()
+	newState := State(stateVal)
+	// Fix #8: reset probe counter when Redis tells us we entered HalfOpen.
+	if newState == StateHalfOpen && prev.state != StateHalfOpen {
+		cb.halfOpenInFlight.Store(0)
+	}
+	cb.cache.Store(&stateSnapshot{state: newState, generation: gen, expiry: expiry})
 
 	if prev.generation != gen {
 		cb.localConsecFail.Store(0)
 		cb.localConsecSucc.Store(0)
 		slog.Info("circuit_breaker: state synced from Redis",
-			"name", cb.name, "state", State(stateVal), "generation", gen,
+			"name", cb.name, "state", newState, "generation", gen,
 			"prev_generation", prev.generation)
 	}
 }
 
-// reconcileWithRedis is called once when Redis comes back after a degraded period.
+// reconcileWithRedis resolves state divergence after a degraded period.
+// Fix #9: uses statePriority map — correctness does not depend on iota ordering.
 //
-// Reconciliation rule — the more protective state wins:
-//
-//	Open (2) > HalfOpen (1) > Closed (0)
-//
-// If the local state is more open than Redis (e.g. this pod tripped while Redis
-// was down), we push our state to Redis so all other pods pick it up within their
-// next SyncInterval. If Redis is same or more open, we adopt Redis.
-//
-// This guarantees that a pod which correctly detected failures during an outage
-// does not silently discard that signal when the cluster reconnects.
+// Rule: the more protective state wins (Open > HalfOpen > Closed).
 func (cb *CircuitBreaker) reconcileWithRedis(ctx context.Context, redisState State, redisExpiry time.Time, redisGen uint64) error {
-	cb.cacheMu.RLock()
-	localSnap := cb.cache
-	cb.cacheMu.RUnlock()
+	localSnap := cb.cache.Load()
 
 	slog.Info("circuit_breaker: reconcile",
 		"name", cb.name, "local_state", localSnap.state, "redis_state", redisState)
 
-	if localSnap.state > redisState {
-		// Local is more protective — push it to Redis so peers converge.
+	if statePriority[localSnap.state] > statePriority[redisState] {
 		slog.Info("circuit_breaker: reconcile: pushing local state to Redis",
 			"name", cb.name, "local", localSnap.state, "redis", redisState)
 
 		newExpiry := cb.expiryForState(localSnap.state, time.Now())
 		gen, ok, err := cb.counts.NewGeneration(ctx, int64(redisState), int64(localSnap.state), newExpiry)
 		if err != nil {
-			// Redis went away again immediately after recovery — stay local.
 			cb.enterDegraded(err)
 			return err
 		}
 		if ok {
-			cb.cacheMu.Lock()
-			cb.cache = stateSnapshot{state: localSnap.state, generation: gen, expiry: newExpiry}
-			cb.cacheMu.Unlock()
+			if localSnap.state == StateHalfOpen {
+				cb.halfOpenInFlight.Store(0)
+			}
+			cb.cache.Store(&stateSnapshot{state: localSnap.state, generation: gen, expiry: newExpiry})
 			slog.Info("circuit_breaker: reconcile: local state pushed to Redis",
 				"name", cb.name, "state", localSnap.state, "generation", gen)
 			return nil
 		}
-		// CAS lost — another pod raced us. Fall through to adopt Redis state.
 		slog.Debug("circuit_breaker: reconcile: push CAS missed, adopting Redis state",
 			"name", cb.name)
 	}
 
-	// Redis is same or more open — adopt it.
-	cb.cacheMu.Lock()
-	cb.cache = stateSnapshot{state: redisState, generation: redisGen, expiry: redisExpiry}
-	cb.cacheMu.Unlock()
+	// Redis is same or more protective — adopt it.
+	if redisState == StateHalfOpen && localSnap.state != StateHalfOpen {
+		cb.halfOpenInFlight.Store(0)
+	}
+	cb.cache.Store(&stateSnapshot{state: redisState, generation: redisGen, expiry: redisExpiry})
 	cb.localConsecFail.Store(0)
 	cb.localConsecSucc.Store(0)
 
@@ -542,35 +549,27 @@ func (cb *CircuitBreaker) enterDegraded(err error) {
 }
 
 // syncLoop is the background goroutine.
-// It runs every SyncInterval to:
-//  1. Drive time-based transitions (Open timeout → HalfOpen, Closed interval reset).
-//  2. Pick up transitions made by peer pods via refreshCache.
-//
-// This is the only Redis I/O in steady state:
-// one GetStateSnapshot every SyncInterval per pod, regardless of RPS.
-func (cb *CircuitBreaker) syncLoop() {
+// Fix #5: takes ctx derived from stopCancel so Redis calls inside tick are cancellable.
+// Fix #6: defers wg.Done so Stop() blocks until this goroutine exits.
+func (cb *CircuitBreaker) syncLoop(ctx context.Context) {
+	defer cb.wg.Done()
 	ticker := time.NewTicker(cb.syncInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-cb.stopSync:
+		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			cb.tick(now)
+			cb.tick(ctx, now)
 		}
 	}
 }
 
-func (cb *CircuitBreaker) tick(now time.Time) {
-	ctx := context.Background()
-
-	// Check time-based transitions using the locally cached expiry — no Redis read.
-	cb.cacheMu.RLock()
-	snap := cb.cache
-	cb.cacheMu.RUnlock()
-
-	slog.Info("ticker is running")
+// Fix #4: removed slog.Info("ticker is running") — was firing 10×/sec in production.
+// Fix #5: takes ctx so Redis calls inside refreshCache can be cancelled on Stop().
+func (cb *CircuitBreaker) tick(ctx context.Context, now time.Time) {
+	snap := cb.cache.Load()
 
 	switch snap.state {
 	case StateClosed:
@@ -586,9 +585,6 @@ func (cb *CircuitBreaker) tick(now time.Time) {
 		}
 	}
 
-	// Sync with Redis to pick up transitions made by other pods.
-	// refreshCache handles all logging (once on degraded entry, once on recovery).
-	// No additional log here to avoid duplicating messages.
 	_ = cb.refreshCache(ctx)
 }
 

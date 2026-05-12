@@ -55,13 +55,13 @@ func (f *fakeDriver) NewGeneration(_ context.Context, fromState, toState int64, 
 	}
 	if fromState == -1 {
 		if f.initialized {
-			return f.generation, true, nil // already seeded; no reset
+			return f.generation, true, nil
 		}
 		f.state, f.expiry, f.generation, f.initialized = toState, expiry, 1, true
 		return 1, true, nil
 	}
 	if f.state != fromState {
-		return f.generation, false, nil // CAS miss
+		return f.generation, false, nil
 	}
 	f.generation++
 	f.state, f.expiry = toState, expiry
@@ -70,13 +70,11 @@ func (f *fakeDriver) NewGeneration(_ context.Context, fromState, toState int64, 
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-// noSyncCB creates a circuit breaker whose background goroutine never fires
-// during a test; tests drive ticks manually via cb.tick().
 func noSyncCB(fake *fakeDriver, patch ...func(*Settings)) *CircuitBreaker {
 	st := Settings{
 		Redis:        fake,
 		Name:         "test",
-		SyncInterval: time.Hour, // never fires automatically in tests
+		SyncInterval: time.Hour,
 		ReadyToTrip:  func(c LocalCounts) bool { return c.ConsecutiveFailures >= 3 },
 	}
 	for _, p := range patch {
@@ -89,7 +87,7 @@ var errDown = errors.New("downstream unavailable")
 
 func executeN(cb *CircuitBreaker, n int, reqErr error) {
 	for i := 0; i < n; i++ {
-		cb.Execute(context.Background(), func() (any, error) { return nil, reqErr })
+		cb.Execute(context.Background(), func() error { return reqErr })
 	}
 }
 
@@ -125,10 +123,10 @@ func TestTrip_ClosedToOpen(t *testing.T) {
 	defer cb.Stop()
 
 	executeN(cb, 2, errDown)
-	assertState(t, cb, StateClosed) // 2 < threshold(3)
+	assertState(t, cb, StateClosed)
 
 	executeN(cb, 1, errDown)
-	assertState(t, cb, StateOpen) // 3 == threshold
+	assertState(t, cb, StateOpen)
 }
 
 func TestOpen_RejectsRequests(t *testing.T) {
@@ -138,7 +136,7 @@ func TestOpen_RejectsRequests(t *testing.T) {
 	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	_, err := cb.Execute(context.Background(), func() (any, error) { return nil, nil })
+	err := cb.Execute(context.Background(), func() error { return nil })
 	if !errors.Is(err, ErrOpenState) {
 		t.Fatalf("expected ErrOpenState, got %v", err)
 	}
@@ -152,28 +150,27 @@ func TestOpen_ToHalfOpen_AfterTimeout(t *testing.T) {
 	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	// Advance synthetic time past the timeout.
-	cb.tick(time.Now().Add(200 * time.Millisecond))
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
 	assertState(t, cb, StateHalfOpen)
 }
 
 func TestHalfOpen_ClosesAfterEnoughSuccesses(t *testing.T) {
 	fake := &fakeDriver{}
 	cb := noSyncCB(fake, func(s *Settings) {
-		s.Timeout = 50 * time.Millisecond
+		s.Timeout     = 50 * time.Millisecond
 		s.MaxRequests = 2
 	})
 	defer cb.Stop()
 
 	executeN(cb, 3, errDown)
-	cb.tick(time.Now().Add(200 * time.Millisecond)) // → HalfOpen
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
 	assertState(t, cb, StateHalfOpen)
 
 	executeN(cb, 1, nil)
-	assertState(t, cb, StateHalfOpen) // 1 < maxRequests(2)
+	assertState(t, cb, StateHalfOpen)
 
 	executeN(cb, 1, nil)
-	assertState(t, cb, StateClosed) // 2 == maxRequests
+	assertState(t, cb, StateClosed)
 }
 
 func TestHalfOpen_ReOpensOnFailure(t *testing.T) {
@@ -182,11 +179,33 @@ func TestHalfOpen_ReOpensOnFailure(t *testing.T) {
 	defer cb.Stop()
 
 	executeN(cb, 3, errDown)
-	cb.tick(time.Now().Add(200 * time.Millisecond)) // → HalfOpen
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
 	assertState(t, cb, StateHalfOpen)
 
-	executeN(cb, 1, errDown) // probe fails → back to Open
+	executeN(cb, 1, errDown)
 	assertState(t, cb, StateOpen)
+}
+
+func TestHalfOpen_LimitsInFlightProbes(t *testing.T) {
+	fake := &fakeDriver{}
+	cb := noSyncCB(fake, func(s *Settings) {
+		s.Timeout     = 50 * time.Millisecond
+		s.MaxRequests = 1
+	})
+	defer cb.Stop()
+
+	executeN(cb, 3, errDown)
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
+	assertState(t, cb, StateHalfOpen)
+
+	// First probe is allowed.
+	// Second concurrent probe must be rejected with ErrOpenState.
+	cb.halfOpenInFlight.Store(1) // simulate one probe already in flight
+
+	err := cb.Execute(context.Background(), func() error { return nil })
+	if !errors.Is(err, ErrOpenState) {
+		t.Fatalf("expected ErrOpenState when in-flight limit reached, got %v", err)
+	}
 }
 
 func TestClosedInterval_ResetsGeneration(t *testing.T) {
@@ -194,15 +213,11 @@ func TestClosedInterval_ResetsGeneration(t *testing.T) {
 	cb := noSyncCB(fake, func(s *Settings) { s.Interval = 50 * time.Millisecond })
 	defer cb.Stop()
 
-	cb.cacheMu.RLock()
-	gen1 := cb.cache.generation
-	cb.cacheMu.RUnlock()
+	gen1 := cb.cache.Load().generation
 
-	cb.tick(time.Now().Add(200 * time.Millisecond))
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
 
-	cb.cacheMu.RLock()
-	gen2 := cb.cache.generation
-	cb.cacheMu.RUnlock()
+	gen2 := cb.cache.Load().generation
 
 	if gen2 <= gen1 {
 		t.Fatalf("generation should advance after interval reset: %d → %d", gen1, gen2)
@@ -220,7 +235,7 @@ func TestExecute_PanicCountsAsFailure(t *testing.T) {
 				panicked = true
 			}
 		}()
-		cb.Execute(context.Background(), func() (any, error) {
+		cb.Execute(context.Background(), func() error {
 			panic("boom")
 		})
 	}()
@@ -235,12 +250,12 @@ func TestExecute_PanicCountsAsFailure(t *testing.T) {
 
 func TestIsSuccessful_Override(t *testing.T) {
 	cb := noSyncCB(&fakeDriver{}, func(s *Settings) {
-		s.IsSuccessful = func(error) bool { return true } // everything is a success
+		s.IsSuccessful = func(error) bool { return true }
 	})
 	defer cb.Stop()
 
 	executeN(cb, 20, errDown)
-	assertState(t, cb, StateClosed) // should never trip
+	assertState(t, cb, StateClosed)
 }
 
 func TestReadyToTrip_CustomThreshold(t *testing.T) {
@@ -268,9 +283,9 @@ func TestOnStateChange_Callback(t *testing.T) {
 	})
 	defer cb.Stop()
 
-	executeN(cb, 3, errDown)                        // Closed → Open
-	cb.tick(time.Now().Add(200 * time.Millisecond)) // Open → HalfOpen
-	executeN(cb, 1, nil)                            // HalfOpen → Closed
+	executeN(cb, 3, errDown)
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
+	executeN(cb, 1, nil)
 
 	mu.Lock()
 	got := append([]string(nil), transitions...)
@@ -292,18 +307,13 @@ func TestGenerationGuard_StaleResultDiscarded(t *testing.T) {
 	cb := noSyncCB(fake)
 	defer cb.Stop()
 
-	// Capture generation before tripping.
-	cb.cacheMu.RLock()
-	stalGen := cb.cache.generation
-	cb.cacheMu.RUnlock()
+	stalGen := cb.cache.Load().generation
 
-	executeN(cb, 3, errDown) // trips → new generation
+	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	// Inject a "late" result from the pre-trip generation.
 	cb.afterRequest(context.Background(), stalGen, true)
 
-	// State must still be Open; the stale success should be ignored.
 	assertState(t, cb, StateOpen)
 }
 
@@ -317,8 +327,6 @@ func TestName(t *testing.T) {
 
 // ─── degraded-mode unit tests ────────────────────────────────────────────────
 
-// TestDegraded_StartsLocalWhenRedisDown verifies the breaker starts in degraded mode
-// and still trips locally when Redis is unreachable at startup.
 func TestDegraded_StartsLocalWhenRedisDown(t *testing.T) {
 	fake := &fakeDriver{}
 	fake.setFailing(true)
@@ -329,32 +337,26 @@ func TestDegraded_StartsLocalWhenRedisDown(t *testing.T) {
 	if !cb.IsDegraded() {
 		t.Fatal("should be degraded when Redis is unreachable at startup")
 	}
-	assertState(t, cb, StateClosed) // default is Closed
+	assertState(t, cb, StateClosed)
 
 	executeN(cb, 3, errDown)
-	assertState(t, cb, StateOpen) // tripped locally despite Redis being down
+	assertState(t, cb, StateOpen)
 }
 
-// TestDegraded_ReconcileLocalOpenWins: this pod tripped locally while Redis was down.
-// When Redis comes back (with Closed state), the local Open state is pushed to Redis.
 func TestDegraded_ReconcileLocalOpenWins(t *testing.T) {
 	fake := &fakeDriver{}
-	cb := noSyncCB(fake) // Redis is up; initialises with Closed, gen=1
+	cb := noSyncCB(fake)
 	defer cb.Stop()
 
-	// Redis goes down; mark pod as degraded.
 	fake.setFailing(true)
 	cb.degraded.Store(true)
 
-	// Trip locally.
 	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	// Redis comes back (still holds Closed, gen=1 from init).
 	fake.setFailing(false)
-	cb.tick(time.Now()) // triggers refreshCache → reconcileWithRedis
+	cb.tick(context.Background(), time.Now())
 
-	// Local Open(2) > Redis Closed(0) → pushed Open to Redis.
 	assertState(t, cb, StateOpen)
 	if cb.IsDegraded() {
 		t.Fatal("should not be degraded after Redis recovery")
@@ -369,30 +371,22 @@ func TestDegraded_ReconcileLocalOpenWins(t *testing.T) {
 	}
 }
 
-// TestDegraded_ReconcileRedisOpenWins: another pod tripped Redis while this pod was
-// degraded (local state stayed Closed). On recovery, the pod adopts Redis Open.
 func TestDegraded_ReconcileRedisOpenWins(t *testing.T) {
 	fake := &fakeDriver{}
-	cb := noSyncCB(fake) // initialises Closed, gen=1
+	cb := noSyncCB(fake)
 	defer cb.Stop()
 
-	// Simulate another pod tripping Redis to Open.
 	fake.forceState(int64(StateOpen), 5)
-
-	// This pod enters degraded mode with Closed local state.
 	cb.degraded.Store(true)
 
-	cb.tick(time.Now()) // refreshCache → reconcileWithRedis
+	cb.tick(context.Background(), time.Now())
 
-	// Redis Open(2) > Local Closed(0) → adopt Redis.
 	assertState(t, cb, StateOpen)
 	if cb.IsDegraded() {
 		t.Fatal("should not be degraded after Redis recovery")
 	}
 }
 
-// TestDegraded_TransitionDuringOutage ensures state transitions work even when Redis
-// is unavailable during the entire lifecycle (Open timeout → HalfOpen locally).
 func TestDegraded_TransitionDuringOutage(t *testing.T) {
 	fake := &fakeDriver{}
 	fake.setFailing(true)
@@ -400,18 +394,15 @@ func TestDegraded_TransitionDuringOutage(t *testing.T) {
 	cb := noSyncCB(fake, func(s *Settings) { s.Timeout = 50 * time.Millisecond })
 	defer cb.Stop()
 
-	executeN(cb, 3, errDown) // trip locally
+	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	// Advance past the Open timeout.
-	cb.tick(time.Now().Add(200 * time.Millisecond))
-	// Open→HalfOpen is applied locally despite Redis being unreachable.
+	cb.tick(context.Background(), time.Now().Add(200*time.Millisecond))
 	assertState(t, cb, StateHalfOpen)
 }
 
 // ─── multi-pod unit tests ────────────────────────────────────────────────────
 
-// TestTwoPods_TripPropagates: pod1 trips the shared fake; pod2 learns on its next tick.
 func TestTwoPods_TripPropagates(t *testing.T) {
 	fake := &fakeDriver{}
 
@@ -422,14 +413,12 @@ func TestTwoPods_TripPropagates(t *testing.T) {
 
 	executeN(cb1, 3, errDown)
 	assertState(t, cb1, StateOpen)
-	assertState(t, cb2, StateClosed) // hasn't synced yet
+	assertState(t, cb2, StateClosed)
 
-	cb2.tick(time.Now()) // sync from shared fake
+	cb2.tick(context.Background(), time.Now())
 	assertState(t, cb2, StateOpen)
 }
 
-// TestTwoPods_CASPreventsDoubleFire: both pods try to trip simultaneously;
-// only one Lua CAS succeeds, onStateChange fires exactly once across both pods.
 func TestTwoPods_CASPreventsDoubleFire(t *testing.T) {
 	fake := &fakeDriver{}
 	var fires int
@@ -448,10 +437,8 @@ func TestTwoPods_CASPreventsDoubleFire(t *testing.T) {
 	defer cb1.Stop()
 	defer cb2.Stop()
 
-	// Both pods independently build up 3 failures against the same fake.
-	// Since the fake has a shared state and generation, only the first CAS wins.
 	executeN(cb1, 3, errDown)
-	executeN(cb2, 3, errDown) // cb2 will get CAS miss on setState; cb1 already transitioned
+	executeN(cb2, 3, errDown)
 
 	firesMu.Lock()
 	got := fires
@@ -464,8 +451,6 @@ func TestTwoPods_CASPreventsDoubleFire(t *testing.T) {
 
 // ─── concurrency ────────────────────────────────────────────────────────────
 
-// TestConcurrent_NoDataRace runs 1 000 goroutines and verifies no data races.
-// Run with: go test -race ./...
 func TestConcurrent_NoDataRace(t *testing.T) {
 	fake := &fakeDriver{}
 	cb := noSyncCB(fake, func(s *Settings) {
@@ -484,14 +469,13 @@ func TestConcurrent_NoDataRace(t *testing.T) {
 			if i%7 == 0 {
 				reqErr = errDown
 			}
-			cb.Execute(context.Background(), func() (any, error) { return nil, reqErr })
+			cb.Execute(context.Background(), func() error { return reqErr })
 		}()
 	}
 	wg.Wait()
 }
 
 // ─── integration tests ──────────────────────────────────────────────────────
-// Skipped automatically when Redis is not reachable.
 
 const redisURL = "redis://:123@localhost:6379/0"
 
@@ -530,20 +514,16 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 
 	assertState(t, cb, StateClosed)
 
-	// Trip.
 	executeN(cb, 3, errDown)
 	assertState(t, cb, StateOpen)
 
-	// Verify rejection.
-	_, err := cb.Execute(context.Background(), func() (any, error) { return nil, nil })
+	err := cb.Execute(context.Background(), func() error { return nil })
 	if !errors.Is(err, ErrOpenState) {
 		t.Fatalf("expected ErrOpenState while open, got %v", err)
 	}
 
-	// Wait for Open → HalfOpen (timeout 80ms + up to one SyncInterval 20ms).
 	waitState(t, cb, StateHalfOpen, 200*time.Millisecond)
 
-	// Probe success → Closed.
 	executeN(cb, 1, nil)
 	assertState(t, cb, StateClosed)
 }
@@ -570,7 +550,6 @@ func TestIntegration_TwoPods_ShareState(t *testing.T) {
 	executeN(pod1, 3, errDown)
 	assertState(t, pod1, StateOpen)
 
-	// pod2 must pick up Open state within SyncInterval.
 	waitState(t, pod2, StateOpen, 100*time.Millisecond)
 }
 
@@ -590,7 +569,6 @@ func TestIntegration_NewPod_InheritsOpenState(t *testing.T) {
 	executeN(pod1, 3, errDown)
 	assertState(t, pod1, StateOpen)
 
-	// A brand-new pod starts after pod1 has already tripped.
 	pod2 := NewCircuitBreaker(Settings{
 		Redis:        redisdriver.New(rdb, key, time.Hour),
 		Name:         "pod2",
@@ -599,8 +577,6 @@ func TestIntegration_NewPod_InheritsOpenState(t *testing.T) {
 	})
 	defer pod2.Stop()
 
-	// pod2's NewCircuitBreaker calls NewGeneration(-1,...) which finds key exists
-	// and returns current gen, then refreshCache loads Open state.
 	assertState(t, pod2, StateOpen)
 }
 
@@ -622,25 +598,13 @@ func TestIntegration_IsDegraded_FalseWhenRedisUp(t *testing.T) {
 }
 
 // ─── benchmarks ─────────────────────────────────────────────────────────────
-//
-// Run with: go test -bench=. -benchmem ./circuit_breaker/
-//
-// Expected results (Apple M-class / ~3 GHz):
-//
-//	BenchmarkHotPath_Closed_Sequential  ~  60 ns/op   0 allocs/op
-//	BenchmarkHotPath_Closed_Parallel    ~  30 ns/op   0 allocs/op   (8 cores)
-//	BenchmarkHotPath_Open_Parallel      ~  15 ns/op   0 allocs/op   (cache read only)
-//	BenchmarkBeforeRequest              ~  15 ns/op   0 allocs/op
-//
-// The integration benchmark should show the same numbers as the fake benchmarks,
-// proving Redis is never touched on the hot path.
 
 func benchCB() *CircuitBreaker {
 	return NewCircuitBreaker(Settings{
 		Redis:        &fakeDriver{},
 		Name:         "bench",
-		SyncInterval: time.Hour,                               // no background Redis I/O
-		ReadyToTrip:  func(LocalCounts) bool { return false }, // never trip during bench
+		SyncInterval: time.Hour,
+		ReadyToTrip:  func(LocalCounts) bool { return false },
 	})
 }
 
@@ -652,7 +616,7 @@ func BenchmarkHotPath_Closed_Sequential(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		cb.Execute(ctx, func() (any, error) { return nil, nil })
+		cb.Execute(ctx, func() error { return nil })
 	}
 }
 
@@ -665,20 +629,15 @@ func BenchmarkHotPath_Closed_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			cb.Execute(ctx, func() (any, error) { return nil, nil })
+			cb.Execute(ctx, func() error { return nil })
 		}
 	})
 }
 
-// BenchmarkHotPath_Open_Parallel measures the fast rejection path.
-// The RLock + struct copy + ErrOpenState return should be cheaper than the success path.
 func BenchmarkHotPath_Open_Parallel(b *testing.B) {
 	cb := benchCB()
 	defer cb.Stop()
-	// Force Open without touching Redis.
-	cb.cacheMu.Lock()
-	cb.cache = stateSnapshot{state: StateOpen, generation: 1}
-	cb.cacheMu.Unlock()
+	cb.cache.Store(&stateSnapshot{state: StateOpen, generation: 1})
 
 	ctx := context.Background()
 	b.ReportAllocs()
@@ -686,12 +645,11 @@ func BenchmarkHotPath_Open_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			cb.Execute(ctx, func() (any, error) { return nil, nil })
+			cb.Execute(ctx, func() error { return nil })
 		}
 	})
 }
 
-// BenchmarkBeforeRequest isolates the pure allow/reject cost (no afterRequest).
 func BenchmarkBeforeRequest(b *testing.B) {
 	cb := benchCB()
 	defer cb.Stop()
@@ -703,8 +661,6 @@ func BenchmarkBeforeRequest(b *testing.B) {
 	}
 }
 
-// BenchmarkHotPath_MixedFailures tests the realistic case: 10% failure rate,
-// threshold high enough never to trip. Exercises the atomic counters on the failure path.
 func BenchmarkHotPath_MixedFailures_Parallel(b *testing.B) {
 	cb := NewCircuitBreaker(Settings{
 		Redis:        &fakeDriver{},
@@ -725,13 +681,11 @@ func BenchmarkHotPath_MixedFailures_Parallel(b *testing.B) {
 			if i%10 == 0 {
 				reqErr = errDown
 			}
-			cb.Execute(ctx, func() (any, error) { return nil, reqErr })
+			cb.Execute(ctx, func() error { return reqErr })
 		}
 	})
 }
 
-// BenchmarkIntegration_Closed_Parallel demonstrates that real Redis behind the Driver
-// adds zero latency to the hot path (same numbers as the fake benchmark above).
 func BenchmarkIntegration_Closed_Parallel(b *testing.B) {
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -749,8 +703,8 @@ func BenchmarkIntegration_Closed_Parallel(b *testing.B) {
 	cb := NewCircuitBreaker(Settings{
 		Redis:        redisdriver.New(rdb, key, time.Hour),
 		Name:         "bench-integration",
-		SyncInterval: time.Hour,                               // no background reads during bench
-		ReadyToTrip:  func(LocalCounts) bool { return false }, // never trip
+		SyncInterval: time.Hour,
+		ReadyToTrip:  func(LocalCounts) bool { return false },
 	})
 	defer cb.Stop()
 	ctx := context.Background()
@@ -759,7 +713,7 @@ func BenchmarkIntegration_Closed_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			cb.Execute(ctx, func() (any, error) { return nil, nil })
+			cb.Execute(ctx, func() error { return nil })
 		}
 	})
 }
