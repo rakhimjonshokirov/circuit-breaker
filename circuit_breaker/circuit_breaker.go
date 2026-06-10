@@ -425,10 +425,15 @@ func (cb *CircuitBreaker) setState(ctx context.Context, from, to State, now time
 	cb.localConsecFail.Store(0)
 	cb.localConsecSucc.Store(0)
 
-	slog.Info("circuit_breaker: state changed",
-		"name", cb.name, "from", from, "to", to, "generation", gen)
-	if cb.onStateChange != nil {
-		cb.onStateChange(cb.name, from, to)
+	if from != to {
+		slog.Info("circuit_breaker: state changed",
+			"name", cb.name, "from", from, "to", to, "generation", gen)
+		if cb.onStateChange != nil {
+			cb.onStateChange(cb.name, from, to)
+		}
+	} else {
+		slog.Debug("circuit_breaker: counts reset",
+			"name", cb.name, "state", to, "generation", gen)
 	}
 	return nil
 }
